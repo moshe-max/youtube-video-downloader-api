@@ -1,74 +1,129 @@
 #!/usr/bin/env python3
 """
-🎥 YT DOWNLOADER API v2.3 - FORCE MP4 OUTPUT
-- Explicit MP4 format selection
-- No HTML/MHTML fallbacks
-- Detailed yt-dlp format debug
+🎥 YT DOWNLOADER API v2.4 - DYNAMIC MP4 SELECTION
+- Auto-detects BEST available MP4 format
+- Lists ALL formats for debug
+- Fallback to any video if no MP4
 """
 
 import os
 import re
 import json
-import glob
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import yt_dlp
 import tempfile
 import shutil
+import glob
 
 app = Flask(__name__)
 CORS(app)
 
 # ================================
-# 🔧 CONFIGURATION - MP4 ONLY
+# 🔧 CONFIGURATION
 # ================================
 
 MAX_DURATION = 20 * 60
 ALLOWED_RESOLUTIONS = ['360p', '480p', '720p']
-DEFAULT_RESOLUTION = '360p'
+DEFAULT_RESOLUTION = '720p'  # Start with highest
 MAX_FILE_SIZE = 50 * 1024 * 1024
 TEMP_DIR = tempfile.mkdtemp()
 
-# 🔥 MP4-SPECIFIC FORMATS (NO HTML FALLBACKS)
-VIDEO_FORMATS = {
-    '360p': 'best[ext=mp4][height<=360]/worst[ext=mp4][height<=360]',
-    '480p': 'best[ext=mp4][height<=480]/worst[ext=mp4][height<=480]',
-    '720p': 'best[ext=mp4][height<=720]/worst[ext=mp4][height<=720]'
-}
-
 # ================================
-# 🛠️ ROBUST FILE FINDER
+# 🛠️ SMART FORMAT SELECTOR
 # ================================
 
-def find_video_file(temp_dir, info):
-    """Find MP4 files ONLY"""
-    print(f"🔍 Searching MP4 in: {temp_dir}")
+def get_best_format(url, target_resolution):
+    """Dynamically find best MP4 format"""
+    print(f"🔍 Finding best format for {target_resolution}...")
+    
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+    }
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        
+        # Get all MP4 formats
+        mp4_formats = []
+        for f in info.get('formats', []):
+            if f.get('ext') == 'mp4' and f.get('height') and f.get('vcodec') != 'none':
+                mp4_formats.append({
+                    'format_id': f.get('format_id'),
+                    'height': f.get('height'),
+                    'filesize': f.get('filesize', 0),
+                    'fps': f.get('fps', 0),
+                    'format_note': f.get('format_note', ''),
+                    'vcodec': f.get('vcodec', '')
+                })
+        
+        print(f"📊 Found {len(mp4_formats)} MP4 formats:")
+        for fmt in sorted(mp4_formats, key=lambda x: x['height'], reverse=True)[:10]:
+            size = fmt['filesize'] / (1024*1024) if fmt['filesize'] else '?'
+            print(f"  {fmt['format_id']}: {fmt['height']}p ({size:.1f}MB, {fmt['fps']}fps)")
+        
+        if not mp4_formats:
+            print("❌ No MP4 formats found - trying any video")
+            # Fallback: best video regardless of container
+            return 'best[height<=720]/best'
+        
+        # Find best MP4 <= target resolution
+        target_height = int(target_resolution[:-1])
+        best_format = None
+        best_height = 0
+        
+        for fmt in mp4_formats:
+            height = fmt['height']
+            if height <= target_height and height > best_height:
+                best_format = fmt['format_id']
+                best_height = height
+        
+        # If no exact match, take highest available
+        if not best_format:
+            best_format = max(mp4_formats, key=lambda x: x['height'])['format_id']
+            best_height = max(mp4_formats, key=lambda x: x['height'])['height']
+        
+        format_selector = f"{best_format}/best[ext=mp4]"
+        print(f"✅ Selected: {best_format} ({best_height}p)")
+        
+        return format_selector, {
+            'selected_format_id': best_format,
+            'selected_height': best_height,
+            'total_mp4_formats': len(mp4_formats)
+        }
+
+# ================================
+# 🛠️ FILE FINDER
+# ================================
+
+def find_video_file(temp_dir):
+    """Find largest video file"""
+    if not os.path.exists(temp_dir):
+        return None
     
     all_files = os.listdir(temp_dir)
-    print(f"📁 ALL FILES ({len(all_files)}): {all_files}")
+    video_files = [f for f in all_files if any(f.lower().endswith(ext) for ext in ['.mp4', '.mkv', '.webm'])]
     
-    # MP4 files only
-    mp4_files = [f for f in all_files if f.lower().endswith('.mp4')]
-    print(f"🎬 MP4 FILES: {mp4_files}")
+    print(f"📁 Found video files: {video_files}")
     
-    if mp4_files:
-        # Pick largest MP4
-        largest = max(mp4_files, key=lambda f: os.path.getsize(os.path.join(temp_dir, f)))
-        filepath = os.path.join(temp_dir, largest)
-        size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        print(f"✅ LARGEST MP4: {largest} ({size_mb:.1f}MB)")
-        return filepath
+    if not video_files:
+        # Show all files for debug
+        file_sizes = {}
+        for f in all_files:
+            path = os.path.join(temp_dir, f)
+            if os.path.isfile(path):
+                size = os.path.getsize(path) / (1024*1024)
+                file_sizes[f] = f"{size:.1f}MB"
+        print(f"❌ No video files! All files: {file_sizes}")
+        return None
     
-    # Debug: show all file sizes
-    file_info = {}
-    for f in all_files:
-        path = os.path.join(temp_dir, f)
-        if os.path.isfile(path):
-            size_mb = os.path.getsize(path) / (1024 * 1024)
-            file_info[f] = f"{size_mb:.1f}MB"
-    
-    print(f"❌ NO MP4 FILES! All files: {file_info}")
-    return None
+    # Return largest video file
+    largest_file = max(video_files, key=lambda f: os.path.getsize(os.path.join(temp_dir, f)))
+    filepath = os.path.join(temp_dir, largest_file)
+    size_mb = os.path.getsize(filepath) / (1024*1024)
+    print(f"✅ Largest video: {largest_file} ({size_mb:.1f}MB)")
+    return filepath
 
 # ================================
 # 🏥 HEALTH CHECK
@@ -78,14 +133,12 @@ def find_video_file(temp_dir, info):
 def health():
     return jsonify({
         'status': 'healthy',
-        'version': '2.3',
-        'temp_dir': TEMP_DIR,
-        'formats': VIDEO_FORMATS,
-        'message': '🎥 MP4-Only YouTube Downloader'
+        'version': '2.4',
+        'message': '🎥 Dynamic MP4 Selector API'
     })
 
 # ================================
-# 📊 VIDEO INFO + FORMATS
+# 📊 VIDEO INFO
 # ================================
 
 @app.route('/info', methods=['GET'])
@@ -103,16 +156,8 @@ def get_video_info():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
-            # List available MP4 formats for debug
-            mp4_formats = []
-            for f in info.get('formats', []):
-                if f.get('ext') == 'mp4' and f.get('height'):
-                    mp4_formats.append({
-                        'format_id': f.get('format_id'),
-                        'height': f.get('height'),
-                        'filesize': f.get('filesize'),
-                        'fps': f.get('fps')
-                    })
+            # Count MP4 formats
+            mp4_count = sum(1 for f in info.get('formats', []) if f.get('ext') == 'mp4')
             
             result = {
                 'success': True,
@@ -122,8 +167,7 @@ def get_video_info():
                 'duration': info.get('duration', 0),
                 'length': info.get('duration', 0),
                 'thumbnail': info.get('thumbnail'),
-                'mp4_formats_available': len(mp4_formats),
-                'sample_formats': mp4_formats[:5],  # First 5 MP4 formats
+                'mp4_formats': mp4_count,
                 'can_download': True
             }
             
@@ -137,7 +181,7 @@ def get_video_info():
         return jsonify({'success': False, 'error': f'Info failed: {str(e)}'}), 500
 
 # ================================
-# ⬇️ MP4-ONLY DOWNLOAD
+# ⬇️ DYNAMIC DOWNLOAD
 # ================================
 
 @app.route('/download', methods=['POST'])
@@ -153,93 +197,60 @@ def download_video():
         if not url:
             return jsonify({'success': False, 'error': 'Missing url'}), 400
         
-        if resolution not in ALLOWED_RESOLUTIONS:
-            resolution = DEFAULT_RESOLUTION
-        
-        format_selector = VIDEO_FORMATS.get(resolution, VIDEO_FORMATS[DEFAULT_RESOLUTION])
-        
-        print(f"\n🎬 MP4 DOWNLOAD START")
+        print(f"\n🎬 DYNAMIC DOWNLOAD START")
         print(f"🔗 URL: {url}")
-        print(f"📐 Resolution: {resolution}")
-        print(f"📐 MP4 Format: {format_selector}")
+        print(f"📐 Target: {resolution}")
         
         # Clear temp dir
         if os.path.exists(TEMP_DIR):
             shutil.rmtree(TEMP_DIR, ignore_errors=True)
         os.makedirs(TEMP_DIR, exist_ok=True)
         
-        # MP4-ONLY yt-dlp options
+        # 🔥 DYNAMIC FORMAT SELECTION
+        format_selector, format_info = get_best_format(url, resolution)
+        print(f"📐 Using format: {format_selector}")
+        
         ydl_opts = {
-            # 🔥 FORCE MP4 - NO FALLBACKS
             'format': format_selector,
-            'outtmpl': '%(title)s [%(height)s].%(ext)s',  # "Title [360].mp4"
+            'outtmpl': '%(title)s.%(ext)s',
             
-            # MP4 settings
-            'merge_output_format': None,  # Don't merge - use MP4 only
-            'format_sort': ['ext:mp4', 'res:720', 'size'],  # Prefer MP4
-            
-            # Debug logging
+            # Debug
             'quiet': False,
             'no_warnings': False,
-            'verbose': True,
             
             # NO EXTRAS
             'writethumbnail': False,
             'write_all_thumbnails': False,
             'embed_thumbnail': False,
             'embed_metadata': False,
-            'embed_subs': False,
-            'writesubtitles': False,
-            'writeautomaticsub': False,
             'noplaylist': True,
             
             # Paths
             'paths': {'home': TEMP_DIR},
         }
         
-        print(f"⬇️ Starting yt-dlp with format: {format_selector}")
-        
+        print("⬇️ Starting download...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Test format availability first
-            try:
-                info = ydl.extract_info(url, download=False)
-                print(f"✅ Info extracted: {info.get('title')}")
-                
-                # Check if MP4 formats exist
-                mp4_count = sum(1 for f in info.get('formats', []) if f.get('ext') == 'mp4')
-                print(f"📊 Available MP4 formats: {mp4_count}")
-                
-                if mp4_count == 0:
-                    return jsonify({
-                        'success': False,
-                        'error': 'No MP4 formats available for this video'
-                    }), 400
-                
-                # Download
-                print("⬇️ Downloading MP4...")
-                info = ydl.extract_info(url, download=True)
-                print(f"✅ Download complete!")
-                
-            except yt_dlp.DownloadError as e:
-                print(f"❌ yt-dlp error: {str(e)}")
-                return jsonify({'success': False, 'error': f'Download failed: {str(e)}'}), 400
+            info = ydl.extract_info(url, download=True)
+            print(f"✅ Download complete: {info.get('title')}")
         
-        # Find MP4 file
-        video_file = find_video_file(TEMP_DIR, info)
-        
+        # Find video file
+        video_file = find_video_file(TEMP_DIR)
         if not video_file:
-            files = os.listdir(TEMP_DIR)
+            files = os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else []
             return jsonify({
                 'success': False,
-                'error': f'No MP4 file found. Files: {files}'
+                'error': f'No video file found. Files: {files}'
             }), 500
         
         file_size = os.path.getsize(video_file)
         if file_size > MAX_FILE_SIZE:
             os.remove(video_file)
-            return jsonify({'success': False, 'error': f'File too large: {file_size/(1024*1024):.1f}MB'}), 413
+            return jsonify({'success': False, 'error': f'File too large'}), 413
         
-        safe_filename = re.sub(r'[^\w\s-]', '_', info.get('title', 'video'))[:80] + f'_{resolution}.mp4'
+        # Safe filename
+        title = info.get('title', 'video')[:80]
+        safe_filename = re.sub(r'[^\w\s-]', '_', title) + '.mp4'
         print(f"📤 Sending: {safe_filename} ({file_size/(1024*1024):.1f}MB)")
         
         response = send_file(
@@ -256,12 +267,14 @@ def download_video():
                 if os.path.exists(video_file):
                     os.remove(video_file)
                 shutil.rmtree(TEMP_DIR, ignore_errors=True)
-                print("🧹 Cleanup complete")
-            except Exception as e:
-                print(f"⚠️ Cleanup error: {e}")
+            except:
+                pass
         
         return response
         
+    except yt_dlp.DownloadError as e:
+        print(f"❌ yt-dlp error: {str(e)}")
+        return jsonify({'success': False, 'error': f'Download failed: {str(e)}'}), 400
     except Exception as e:
         print(f"❌ Server error: {str(e)}")
         import traceback
@@ -275,10 +288,6 @@ def download_video():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     host = '0.0.0.0'
-    
-    print(f"🎥 Starting MP4-Only API v2.3")
+    print(f"🎥 Starting Dynamic MP4 API v2.4")
     print(f"🌐 {host}:{port}")
-    print(f"📁 Temp: {TEMP_DIR}")
-    print("✅ MP4 formats only - no HTML/MHTML")
-    
     app.run(host=host, port=port, debug=False, threaded=True)
