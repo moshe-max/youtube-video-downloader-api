@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-🎥 YT DOWNLOADER API v2.5 - DASH + AUTO-MERGE
-- Handles modern YouTube DASH streams
-- Auto-merges video + audio → MP4
-- Robust format selection
-- Production ready
+🎥 YT DOWNLOADER API v2.6 - ANTI-BLOCK + ROBUST
+- Stealth headers to bypass YouTube blocks
+- Retries with delays
+- Fallback formats
+- MHTML rejection
 """
 
 import os
 import re
 import json
+import time
+import random
 import shutil
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -21,114 +23,102 @@ app = Flask(__name__)
 CORS(app)
 
 # ================================
-# 🔧 CONFIGURATION
+# 🔧 STEALTH CONFIGURATION
 # ================================
 
 MAX_DURATION = 20 * 60
-ALLOWED_RESOLUTIONS = ['360p', '480p', '720p']
-DEFAULT_RESOLUTION = '720p'
 MAX_FILE_SIZE = 50 * 1024 * 1024
 TEMP_DIR = tempfile.mkdtemp()
 
+# Stealth user agents (rotate to avoid blocks)
+STEALTH_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+]
+
 # ================================
-# 🛠️ UNIVERSAL FORMAT SELECTOR
+# 🛡️ ANTI-BLOCK OPTIONS
 # ================================
 
-def get_best_format(url, target_resolution):
-    """Get best format - handles DASH + progressive MP4"""
-    print(f"🔍 Analyzing formats for {target_resolution}...")
-    
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
+def get_stealth_ydl_opts():
+    """yt-dlp options to bypass YouTube blocks"""
+    return {
+        # Stealth headers
+        'user_agent': random.choice(STEALTH_AGENTS),
+        'referer': 'https://www.youtube.com/',
+        'impersonate': 'chrome110',  # Pretend to be Chrome 110
+        
+        # Rate limiting
+        'sleep_interval': 1,
+        'max_sleep_interval': 5,
+        'sleep_subtitles': 3,
+        
+        # Retries
+        'retries': 10,
+        'fragment_retries': 10,
+        'extractor_retries': 5,
+        
+        # Format preference
+        'format': 'bestvideo[height<=720]+bestaudio[ext=m4a]/best[height<=720]/best',
+        'merge_output_format': 'mp4',
+        
+        # NO MHTML/THUMBNAILS
+        'writethumbnail': False,
+        'write_all_thumbnails': False,
+        'embed_thumbnail': False,
+        'noplaylist': True,
+        
+        # Paths
+        'outtmpl': '%(title)s.%(ext)s',
+        'paths': {'home': TEMP_DIR},
+        
+        # Debug
+        'quiet': False,
+        'no_warnings': False,
     }
+
+# ================================
+# 🛠️ FILE VALIDATOR
+# ================================
+
+def is_valid_video_file(filepath):
+    """Check if file is actual video (not MHTML/HTML)"""
+    if not os.path.exists(filepath):
+        return False
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        
-        # Count available formats
-        video_formats = []
-        audio_formats = []
-        
-        for f in info.get('formats', []):
-            if f.get('vcodec') != 'none' and f.get('height'):  # Video streams
-                video_formats.append({
-                    'format_id': f.get('format_id'),
-                    'height': f.get('height'),
-                    'ext': f.get('ext'),
-                    'filesize': f.get('filesize', 0)
-                })
-            elif f.get('acodec') != 'none' and f.get('vcodec') == 'none':  # Audio only
-                audio_formats.append(f.get('format_id'))
-        
-        print(f"📊 Video formats: {len(video_formats)}")
-        print(f"📊 Audio formats: {len(audio_formats)}")
-        
-        # Show top video formats
-        sorted_videos = sorted(video_formats, key=lambda x: x['height'], reverse=True)[:5]
-        for fmt in sorted_videos:
-            size = fmt['filesize'] / (1024*1024) if fmt['filesize'] else '?'
-            print(f"  {fmt['format_id']}: {fmt['height']}p {fmt['ext']} ({size:.1f}MB)")
-        
-        target_height = int(target_resolution[:-1])
-        
-        # Strategy 1: Progressive MP4 (video + audio combined)
-        progressive_mp4 = None
-        for fmt in video_formats:
-            if (fmt['ext'] == 'mp4' and 
-                fmt['height'] <= target_height and 
-                fmt.get('acodec') != 'none'):
-                progressive_mp4 = fmt['format_id']
-                print(f"✅ Progressive MP4 found: {progressive_mp4} ({fmt['height']}p)")
-                return f"{progressive_mp4}", {'type': 'progressive', 'height': fmt['height']}
-        
-        # Strategy 2: DASH merge (best video + best audio)
-        best_video = None
-        best_height = 0
-        
-        for fmt in video_formats:
-            height = fmt['height']
-            if height <= target_height and height > best_height:
-                best_video = fmt['format_id']
-                best_height = height
-        
-        if best_video:
-            # Merge with best audio
-            format_selector = f"{best_video}+bestaudio[ext=m4a]/best[height<={target_height}]"
-            print(f"✅ DASH merge: {best_video} ({best_height}p) + audio")
-            return format_selector, {'type': 'dash', 'height': best_height, 'video_id': best_video}
-        
-        # Strategy 3: Best available
-        if video_formats:
-            best_fmt = max(video_formats, key=lambda x: x['height'])
-            format_selector = f"{best_fmt['format_id']}+bestaudio/best"
-            print(f"⚠️ Fallback: {best_fmt['format_id']} ({best_fmt['height']}p)")
-            return format_selector, {'type': 'fallback', 'height': best_fmt['height']}
-        
-        return 'best', {'type': 'best', 'height': 'unknown'}
+    # Reject MHTML/HTML
+    if filepath.lower().endswith(('.mhtml', '.html')):
+        print(f"❌ REJECTED MHTML: {filepath}")
+        return False
+    
+    # Check size (videos > 1MB)
+    size_mb = os.path.getsize(filepath) / (1024 * 1024)
+    if size_mb < 1:
+        print(f"❌ TOO SMALL: {os.path.basename(filepath)} ({size_mb:.1f}MB)")
+        return False
+    
+    # Check video extensions
+    valid_exts = ['.mp4', '.mkv', '.webm', '.avi', '.mov']
+    if not any(filepath.lower().endswith(ext) for ext in valid_exts):
+        print(f"❌ INVALID EXT: {os.path.basename(filepath)}")
+        return False
+    
+    print(f"✅ VALID VIDEO: {os.path.basename(filepath)} ({size_mb:.1f}MB)")
+    return True
 
-# ================================
-# 🛠️ FILE FINDER
-# ================================
-
-def find_video_file(temp_dir):
-    """Find final merged video file"""
+def find_valid_video(temp_dir):
+    """Find first valid video file"""
     if not os.path.exists(temp_dir):
         return None
     
     all_files = os.listdir(temp_dir)
-    video_exts = ['.mp4', '.mkv', '.webm']
-    video_files = [f for f in all_files if any(f.endswith(ext) for ext in video_exts)]
+    print(f"📁 Checking {len(all_files)} files...")
     
-    print(f"📁 Final files: {video_files}")
-    
-    if video_files:
-        # Pick largest (usually merged file)
-        largest = max(video_files, key=lambda f: os.path.getsize(os.path.join(temp_dir, f)))
-        filepath = os.path.join(temp_dir, largest)
-        size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        print(f"✅ Selected: {largest} ({size_mb:.1f}MB)")
-        return filepath
+    for filename in all_files:
+        filepath = os.path.join(temp_dir, filename)
+        if os.path.isfile(filepath) and is_valid_video_file(filepath):
+            return filepath
     
     # Debug: show all files
     debug = {}
@@ -137,7 +127,7 @@ def find_video_file(temp_dir):
         if os.path.isfile(path):
             size = os.path.getsize(path) / (1024 * 1024)
             debug[f] = f"{size:.1f}MB"
-    print(f"❌ No final video! Raw files: {debug}")
+    print(f"❌ NO VALID VIDEOS! Files: {debug}")
     return None
 
 # ================================
@@ -148,12 +138,13 @@ def find_video_file(temp_dir):
 def health():
     return jsonify({
         'status': 'healthy',
-        'version': '2.5',
-        'message': '🎥 DASH + Merge YouTube Downloader'
+        'version': '2.6',
+        'message': '🎥 Anti-Block YouTube Downloader',
+        'temp_dir': TEMP_DIR
     })
 
 # ================================
-# 📊 VIDEO INFO
+# 📊 VIDEO INFO (STEALTH)
 # ================================
 
 @app.route('/info', methods=['GET'])
@@ -163,12 +154,15 @@ def get_video_info():
         return jsonify({'success': False, 'error': 'Missing url parameter'}), 400
     
     try:
-        ydl_opts = {'quiet': True}
+        ydl_opts = get_stealth_ydl_opts()
+        ydl_opts.update({
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True  # Faster info only
+        })
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
-            # Count video formats
-            video_count = sum(1 for f in info.get('formats', []) if f.get('vcodec') != 'none')
             
             result = {
                 'success': True,
@@ -178,13 +172,12 @@ def get_video_info():
                 'duration': info.get('duration', 0),
                 'length': info.get('duration', 0),
                 'thumbnail': info.get('thumbnail'),
-                'video_formats': video_count,
                 'can_download': True
             }
             
             if result['length'] > MAX_DURATION:
                 result['can_download'] = False
-                result['error'] = f'Video too long ({result["length"]}s)'
+                result['error'] = f'Video too long'
             
             return jsonify(result)
             
@@ -192,7 +185,7 @@ def get_video_info():
         return jsonify({'success': False, 'error': f'Info failed: {str(e)}'}), 500
 
 # ================================
-# ⬇️ UNIVERSAL DOWNLOAD
+# ⬇️ STEALTH DOWNLOAD
 # ================================
 
 @app.route('/download', methods=['POST'])
@@ -203,94 +196,88 @@ def download_video():
             return jsonify({'success': False, 'error': 'No JSON data'}), 400
         
         url = data.get('url')
-        resolution = data.get('resolution', DEFAULT_RESOLUTION)
-        
         if not url:
             return jsonify({'success': False, 'error': 'Missing url'}), 400
         
-        if resolution not in ALLOWED_RESOLUTIONS:
-            resolution = DEFAULT_RESOLUTION
-        
-        print(f"\n🎬 DOWNLOAD START v2.5")
+        print(f"\n🎬 STEALTH DOWNLOAD v2.6")
         print(f"🔗 URL: {url}")
-        print(f"📐 Target: {resolution}")
         
         # Clean temp dir
         if os.path.exists(TEMP_DIR):
             shutil.rmtree(TEMP_DIR, ignore_errors=True)
         os.makedirs(TEMP_DIR, exist_ok=True)
         
-        # Get best format
-        format_selector, format_info = get_best_format(url, resolution)
-        print(f"📐 Format: {format_selector}")
-        print(f"📊 Strategy: {format_info}")
-        
-        ydl_opts = {
-            'format': format_selector,
-            'outtmpl': '%(title)s.%(ext)s',
-            'merge_output_format': 'mp4',  # Always merge to MP4
+        # Try download with retries
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            print(f"🔄 Attempt {attempt + 1}/{max_attempts}")
             
-            # Debug
-            'quiet': False,
-            'no_warnings': False,
+            ydl_opts = get_stealth_ydl_opts()
             
-            # NO EXTRAS
-            'writethumbnail': False,
-            'write_all_thumbnails': False,
-            'embed_thumbnail': False,
-            'noplaylist': True,
-            
-            # Paths
-            'paths': {'home': TEMP_DIR},
-        }
-        
-        print("⬇️ Downloading...")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            print(f"✅ Complete: {info.get('title')}")
-        
-        # Find final MP4
-        video_file = find_video_file(TEMP_DIR)
-        if not video_file:
-            files = os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else []
-            return jsonify({
-                'success': False,
-                'error': f'No video file. Files: {files}'
-            }), 500
-        
-        file_size = os.path.getsize(video_file)
-        if file_size > MAX_FILE_SIZE:
-            os.remove(video_file)
-            return jsonify({'success': False, 'error': f'File too large: {file_size/(1024*1024):.1f}MB'}), 413
-        
-        # Safe filename
-        title = re.sub(r'[^\w\s-]', '_', info.get('title', 'video'))[:80]
-        safe_filename = f"{title}_{format_info['height']}p.mp4"
-        print(f"📤 Sending: {safe_filename} ({file_size/(1024*1024):.1f}MB)")
-        
-        response = send_file(
-            video_file,
-            mimetype='video/mp4',
-            as_attachment=True,
-            download_name=safe_filename,
-            conditional=True
-        )
-        
-        @response.call_on_close
-        def cleanup():
             try:
-                if os.path.exists(video_file):
-                    os.remove(video_file)
-                shutil.rmtree(TEMP_DIR, ignore_errors=True)
-                print("🧹 Cleanup done")
-            except Exception as e:
-                print(f"⚠️ Cleanup error: {e}")
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    print("⬇️ Starting stealth download...")
+                    info = ydl.extract_info(url, download=True)
+                    print(f"✅ Download complete: {info.get('title')}")
+                
+                # Find valid video
+                video_file = find_valid_video(TEMP_DIR)
+                if video_file:
+                    file_size = os.path.getsize(video_file)
+                    if file_size > MAX_FILE_SIZE:
+                        os.remove(video_file)
+                        return jsonify({'success': False, 'error': f'File too large: {file_size/(1024*1024):.1f}MB'}), 413
+                    
+                    # Safe filename
+                    title = re.sub(r'[^\w\s-]', '_', info.get('title', 'video'))[:80]
+                    safe_filename = f"{title}.mp4"
+                    print(f"📤 Sending: {safe_filename} ({file_size/(1024*1024):.1f}MB)")
+                    
+                    response = send_file(
+                        video_file,
+                        mimetype='video/mp4',
+                        as_attachment=True,
+                        download_name=safe_filename,
+                        conditional=True
+                    )
+                    
+                    @response.call_on_close
+                    def cleanup():
+                        try:
+                            if os.path.exists(video_file):
+                                os.remove(video_file)
+                            shutil.rmtree(TEMP_DIR, ignore_errors=True)
+                            print("🧹 Cleanup complete")
+                        except Exception as e:
+                            print(f"⚠️ Cleanup error: {e}")
+                    
+                    return response
+                
+                else:
+                    print(f"❌ Attempt {attempt + 1}: No valid video found")
+                    if attempt < max_attempts - 1:
+                        wait_time = (attempt + 1) * 10  # 10s, 20s, 30s
+                        print(f"⏳ Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                    else:
+                        files = os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else []
+                        return jsonify({
+                            'success': False,
+                            'error': f'No valid video after {max_attempts} attempts. Files: {files}'
+                        }), 500
+                
+            except yt_dlp.DownloadError as e:
+                print(f"❌ Download error (attempt {attempt + 1}): {str(e)}")
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    print("🔄 Rate limited - waiting longer...")
+                    time.sleep(30 * (attempt + 1))
+                elif attempt < max_attempts - 1:
+                    time.sleep(10 * (attempt + 1))
+                else:
+                    return jsonify({'success': False, 'error': f'Download failed after {max_attempts} attempts: {str(e)}'}), 400
         
-        return response
+        return jsonify({'success': False, 'error': 'All download attempts failed'}), 500
         
-    except yt_dlp.DownloadError as e:
-        print(f"❌ Download error: {str(e)}")
-        return jsonify({'success': False, 'error': f'Download failed: {str(e)}'}), 400
     except Exception as e:
         print(f"❌ Server error: {str(e)}")
         import traceback
@@ -304,7 +291,7 @@ def download_video():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     host = '0.0.0.0'
-    print(f"🎥 Starting Universal Downloader v2.5")
+    print(f"🎥 Starting Anti-Block Downloader v2.6")
     print(f"🌐 {host}:{port}")
-    print("✅ Handles DASH + progressive MP4")
+    print("✅ Stealth mode + retries + MHTML rejection")
     app.run(host=host, port=port, debug=False, threaded=True)
