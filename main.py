@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 """
-🎥 YT DOWNLOADER API v2.2 - ROBUST FILE DETECTION
-- Finds ALL downloaded files in temp dir
-- Handles yt-dlp naming variations
-- Detailed debug logging
+🎥 YT DOWNLOADER API v2.3 - FORCE MP4 OUTPUT
+- Explicit MP4 format selection
+- No HTML/MHTML fallbacks
+- Detailed yt-dlp format debug
 """
 
 import os
 import re
 import json
-import time
-import sys
 import glob
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import yt_dlp
 import tempfile
 import shutil
-import threading
-import signal
 
 app = Flask(__name__)
 CORS(app)
 
 # ================================
-# 🔧 CONFIGURATION
+# 🔧 CONFIGURATION - MP4 ONLY
 # ================================
 
 MAX_DURATION = 20 * 60
@@ -33,62 +29,45 @@ DEFAULT_RESOLUTION = '360p'
 MAX_FILE_SIZE = 50 * 1024 * 1024
 TEMP_DIR = tempfile.mkdtemp()
 
+# 🔥 MP4-SPECIFIC FORMATS (NO HTML FALLBACKS)
 VIDEO_FORMATS = {
-    '360p': 'bestvideo[height<=360]+bestaudio[ext=m4a]/best[height<=360]/best[ext=mp4]',
-    '480p': 'bestvideo[height<=480]+bestaudio[ext=m4a]/best[height<=480]/best[ext=mp4]',
-    '720p': 'bestvideo[height<=720]+bestaudio[ext=m4a]/best[height<=720]/best[ext=mp4]'
+    '360p': 'best[ext=mp4][height<=360]/worst[ext=mp4][height<=360]',
+    '480p': 'best[ext=mp4][height<=480]/worst[ext=mp4][height<=480]',
+    '720p': 'best[ext=mp4][height<=720]/worst[ext=mp4][height<=720]'
 }
 
 # ================================
-# 🛠️ FILE FINDER UTILITIES
+# 🛠️ ROBUST FILE FINDER
 # ================================
 
 def find_video_file(temp_dir, info):
-    """Find ANY video file in temp dir - ROBUST"""
-    print(f"🔍 Searching for video in: {temp_dir}")
+    """Find MP4 files ONLY"""
+    print(f"🔍 Searching MP4 in: {temp_dir}")
     
-    # List ALL files before filtering
     all_files = os.listdir(temp_dir)
-    print(f"📁 ALL FILES ({len(all_files)}): {all_files[:10]}{'...' if len(all_files) > 10 else ''}")
+    print(f"📁 ALL FILES ({len(all_files)}): {all_files}")
     
-    # Possible video extensions
-    video_exts = ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.f137.mp4', '.f136.mp4']
+    # MP4 files only
+    mp4_files = [f for f in all_files if f.lower().endswith('.mp4')]
+    print(f"🎬 MP4 FILES: {mp4_files}")
     
-    # 1. Look for files matching video title
-    title = info.get('title', '').replace('/', '_').replace('\\', '_')[:100]
-    print(f"🎬 Title pattern: {title}")
+    if mp4_files:
+        # Pick largest MP4
+        largest = max(mp4_files, key=lambda f: os.path.getsize(os.path.join(temp_dir, f)))
+        filepath = os.path.join(temp_dir, largest)
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        print(f"✅ LARGEST MP4: {largest} ({size_mb:.1f}MB)")
+        return filepath
     
-    for ext in video_exts:
-        pattern = os.path.join(temp_dir, f"*{title}*{ext}")
-        matches = glob.glob(pattern)
-        if matches:
-            print(f"✅ TITLE MATCH: {matches[0]}")
-            return matches[0]
+    # Debug: show all file sizes
+    file_info = {}
+    for f in all_files:
+        path = os.path.join(temp_dir, f)
+        if os.path.isfile(path):
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            file_info[f] = f"{size_mb:.1f}MB"
     
-    # 2. Look for ANY video file > 1MB
-    for filename in all_files:
-        filepath = os.path.join(temp_dir, filename)
-        if os.path.isfile(filepath):
-            size_mb = os.path.getsize(filepath) / (1024 * 1024)
-            if size_mb > 1 and any(filename.lower().endswith(ext) for ext in video_exts):
-                print(f"✅ LARGE VIDEO: {filename} ({size_mb:.1f}MB)")
-                return filepath
-    
-    # 3. Look for ANY file > 1MB (last resort)
-    large_files = []
-    for filename in all_files:
-        filepath = os.path.join(temp_dir, filename)
-        if os.path.isfile(filepath):
-            size_mb = os.path.getsize(filepath) / (1024 * 1024)
-            if size_mb > 1:
-                large_files.append((filename, size_mb))
-    
-    if large_files:
-        large_files.sort(key=lambda x: x[1], reverse=True)
-        print(f"⚠️ Largest files: {large_files[:3]}")
-        return os.path.join(temp_dir, large_files[0][0])
-    
-    print(f"❌ NO VIDEO FILES FOUND")
+    print(f"❌ NO MP4 FILES! All files: {file_info}")
     return None
 
 # ================================
@@ -99,14 +78,14 @@ def find_video_file(temp_dir, info):
 def health():
     return jsonify({
         'status': 'healthy',
-        'version': '2.2',
+        'version': '2.3',
         'temp_dir': TEMP_DIR,
-        'temp_dir_exists': os.path.exists(TEMP_DIR),
-        'message': '🎥 YouTube Downloader API - Robust File Detection'
+        'formats': VIDEO_FORMATS,
+        'message': '🎥 MP4-Only YouTube Downloader'
     })
 
 # ================================
-# 📊 VIDEO INFO
+# 📊 VIDEO INFO + FORMATS
 # ================================
 
 @app.route('/info', methods=['GET'])
@@ -124,6 +103,17 @@ def get_video_info():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
+            # List available MP4 formats for debug
+            mp4_formats = []
+            for f in info.get('formats', []):
+                if f.get('ext') == 'mp4' and f.get('height'):
+                    mp4_formats.append({
+                        'format_id': f.get('format_id'),
+                        'height': f.get('height'),
+                        'filesize': f.get('filesize'),
+                        'fps': f.get('fps')
+                    })
+            
             result = {
                 'success': True,
                 'id': info.get('id'),
@@ -131,22 +121,23 @@ def get_video_info():
                 'author': info.get('uploader', 'Unknown'),
                 'duration': info.get('duration', 0),
                 'length': info.get('duration', 0),
-                'thumbnail': info.get('thumbnail') or f"https://img.youtube.com/vi/{info.get('id')}/maxresdefault.jpg",
-                'formats': len(info.get('formats', [])),
+                'thumbnail': info.get('thumbnail'),
+                'mp4_formats_available': len(mp4_formats),
+                'sample_formats': mp4_formats[:5],  # First 5 MP4 formats
                 'can_download': True
             }
             
             if result['length'] > MAX_DURATION:
                 result['can_download'] = False
-                result['error'] = f'Video too long ({result["length"]}s)'
+                result['error'] = f'Video too long'
             
             return jsonify(result)
             
     except Exception as e:
-        return jsonify({'success': False, 'error': f'Failed to get info: {str(e)}'}), 500
+        return jsonify({'success': False, 'error': f'Info failed: {str(e)}'}), 500
 
 # ================================
-# ⬇️ VIDEO DOWNLOAD
+# ⬇️ MP4-ONLY DOWNLOAD
 # ================================
 
 @app.route('/download', methods=['POST'])
@@ -167,28 +158,30 @@ def download_video():
         
         format_selector = VIDEO_FORMATS.get(resolution, VIDEO_FORMATS[DEFAULT_RESOLUTION])
         
-        print(f"\n🎬 DOWNLOAD START")
+        print(f"\n🎬 MP4 DOWNLOAD START")
         print(f"🔗 URL: {url}")
         print(f"📐 Resolution: {resolution}")
-        print(f"📐 Format: {format_selector}")
-        print(f"📁 Temp dir: {TEMP_DIR}")
+        print(f"📐 MP4 Format: {format_selector}")
         
-        # Clear temp dir first
+        # Clear temp dir
         if os.path.exists(TEMP_DIR):
-            for filename in os.listdir(TEMP_DIR):
-                file_path = os.path.join(TEMP_DIR, filename)
-                try:
-                    if os.path.isfile(file_path):
-                        os.remove(file_path)
-                except:
-                    pass
+            shutil.rmtree(TEMP_DIR, ignore_errors=True)
+        os.makedirs(TEMP_DIR, exist_ok=True)
         
+        # MP4-ONLY yt-dlp options
         ydl_opts = {
+            # 🔥 FORCE MP4 - NO FALLBACKS
             'format': format_selector,
-            'outtmpl': '%(title)s.%(ext)s',  # Simple: "Title.mp4"
-            'merge_output_format': 'mp4',
-            'quiet': False,  # Enable yt-dlp logs for debug
+            'outtmpl': '%(title)s [%(height)s].%(ext)s',  # "Title [360].mp4"
+            
+            # MP4 settings
+            'merge_output_format': None,  # Don't merge - use MP4 only
+            'format_sort': ['ext:mp4', 'res:720', 'size'],  # Prefer MP4
+            
+            # Debug logging
+            'quiet': False,
             'no_warnings': False,
+            'verbose': True,
             
             # NO EXTRAS
             'writethumbnail': False,
@@ -204,73 +197,71 @@ def download_video():
             'paths': {'home': TEMP_DIR},
         }
         
+        print(f"⬇️ Starting yt-dlp with format: {format_selector}")
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            print("⬇️ yt-dlp downloading...")
-            info = ydl.extract_info(url, download=True)
-            print(f"✅ Download complete: {info.get('title', 'Unknown')}")
-            
-            # Find video file (ROBUST)
-            video_file = find_video_file(TEMP_DIR, info)
-            
-            if not video_file:
-                # Debug: list ALL files
-                files = os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else []
-                sizes = [(f, os.path.getsize(os.path.join(TEMP_DIR, f)) / (1024*1024)) for f in files if os.path.isfile(os.path.join(TEMP_DIR, f))]
-                sizes.sort(key=lambda x: x[1], reverse=True)
+            # Test format availability first
+            try:
+                info = ydl.extract_info(url, download=False)
+                print(f"✅ Info extracted: {info.get('title')}")
                 
-                debug_info = {
-                    'files': {f: f"{s:.1f}MB" for f, s in sizes[:10]},
-                    'total_files': len(files),
-                    'temp_dir': TEMP_DIR
-                }
+                # Check if MP4 formats exist
+                mp4_count = sum(1 for f in info.get('formats', []) if f.get('ext') == 'mp4')
+                print(f"📊 Available MP4 formats: {mp4_count}")
                 
-                print(f"❌ DEBUG INFO: {json.dumps(debug_info, indent=2)}")
-                return jsonify({
-                    'success': False,
-                    'error': f'No video file found. Debug: {json.dumps(debug_info)}'
-                }), 500
-            
-            file_size = os.path.getsize(video_file)
-            print(f"📁 Video found: {os.path.basename(video_file)} ({file_size / (1024*1024):.1f}MB)")
-            
-            if file_size > MAX_FILE_SIZE:
-                os.remove(video_file)
-                return jsonify({
-                    'success': False,
-                    'error': f'File too large: {file_size / (1024*1024):.1f}MB'
-                }), 413
-            
-            # Send video
-            safe_filename = re.sub(r'[^\w\s-]', '_', info.get('title', 'video'))[:100] + '.mp4'
-            print(f"📤 Sending: {safe_filename}")
-            
-            response = send_file(
-                video_file,
-                mimetype='video/mp4',
-                as_attachment=True,
-                download_name=safe_filename,
-                conditional=True
-            )
-            
-            # Cleanup after sending
-            @response.call_on_close
-            def cleanup():
-                try:
-                    if os.path.exists(video_file):
-                        os.remove(video_file)
-                        print(f"🧹 Cleaned: {video_file}")
-                    # Clean entire temp dir
-                    if os.path.exists(TEMP_DIR):
-                        for f in os.listdir(TEMP_DIR):
-                            os.remove(os.path.join(TEMP_DIR, f))
-                except Exception as e:
-                    print(f"⚠️ Cleanup failed: {e}")
-            
-            return response
-            
-    except yt_dlp.DownloadError as e:
-        print(f"❌ yt-dlp error: {str(e)}")
-        return jsonify({'success': False, 'error': f'Download failed: {str(e)}'}), 400
+                if mp4_count == 0:
+                    return jsonify({
+                        'success': False,
+                        'error': 'No MP4 formats available for this video'
+                    }), 400
+                
+                # Download
+                print("⬇️ Downloading MP4...")
+                info = ydl.extract_info(url, download=True)
+                print(f"✅ Download complete!")
+                
+            except yt_dlp.DownloadError as e:
+                print(f"❌ yt-dlp error: {str(e)}")
+                return jsonify({'success': False, 'error': f'Download failed: {str(e)}'}), 400
+        
+        # Find MP4 file
+        video_file = find_video_file(TEMP_DIR, info)
+        
+        if not video_file:
+            files = os.listdir(TEMP_DIR)
+            return jsonify({
+                'success': False,
+                'error': f'No MP4 file found. Files: {files}'
+            }), 500
+        
+        file_size = os.path.getsize(video_file)
+        if file_size > MAX_FILE_SIZE:
+            os.remove(video_file)
+            return jsonify({'success': False, 'error': f'File too large: {file_size/(1024*1024):.1f}MB'}), 413
+        
+        safe_filename = re.sub(r'[^\w\s-]', '_', info.get('title', 'video'))[:80] + f'_{resolution}.mp4'
+        print(f"📤 Sending: {safe_filename} ({file_size/(1024*1024):.1f}MB)")
+        
+        response = send_file(
+            video_file,
+            mimetype='video/mp4',
+            as_attachment=True,
+            download_name=safe_filename,
+            conditional=True
+        )
+        
+        @response.call_on_close
+        def cleanup():
+            try:
+                if os.path.exists(video_file):
+                    os.remove(video_file)
+                shutil.rmtree(TEMP_DIR, ignore_errors=True)
+                print("🧹 Cleanup complete")
+            except Exception as e:
+                print(f"⚠️ Cleanup error: {e}")
+        
+        return response
+        
     except Exception as e:
         print(f"❌ Server error: {str(e)}")
         import traceback
@@ -281,21 +272,13 @@ def download_video():
 # 🚀 SERVER
 # ================================
 
-def run_server():
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     host = '0.0.0.0'
     
-    print(f"🎥 Starting YouTube Downloader API v2.2")
+    print(f"🎥 Starting MP4-Only API v2.3")
     print(f"🌐 {host}:{port}")
     print(f"📁 Temp: {TEMP_DIR}")
-    print("✅ Robust file detection")
-    
-    os.makedirs(TEMP_DIR, exist_ok=True)
+    print("✅ MP4 formats only - no HTML/MHTML")
     
     app.run(host=host, port=port, debug=False, threaded=True)
-
-if __name__ == '__main__':
-    if 'PORT' in os.environ:
-        run_server()
-    else:
-        app.run(debug=True)
