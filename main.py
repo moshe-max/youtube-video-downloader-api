@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-🎥 YT DOWNLOADER API v2.4 - DYNAMIC MP4 SELECTION
-- Auto-detects BEST available MP4 format
-- Lists ALL formats for debug
-- Fallback to any video if no MP4
+🎥 YT DOWNLOADER API v2.5 - DASH + AUTO-MERGE
+- Handles modern YouTube DASH streams
+- Auto-merges video + audio → MP4
+- Robust format selection
+- Production ready
 """
 
 import os
 import re
 import json
+import shutil
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import yt_dlp
 import tempfile
-import shutil
 import glob
 
 app = Flask(__name__)
@@ -25,17 +26,17 @@ CORS(app)
 
 MAX_DURATION = 20 * 60
 ALLOWED_RESOLUTIONS = ['360p', '480p', '720p']
-DEFAULT_RESOLUTION = '720p'  # Start with highest
+DEFAULT_RESOLUTION = '720p'
 MAX_FILE_SIZE = 50 * 1024 * 1024
 TEMP_DIR = tempfile.mkdtemp()
 
 # ================================
-# 🛠️ SMART FORMAT SELECTOR
+# 🛠️ UNIVERSAL FORMAT SELECTOR
 # ================================
 
 def get_best_format(url, target_resolution):
-    """Dynamically find best MP4 format"""
-    print(f"🔍 Finding best format for {target_resolution}...")
+    """Get best format - handles DASH + progressive MP4"""
+    print(f"🔍 Analyzing formats for {target_resolution}...")
     
     ydl_opts = {
         'quiet': True,
@@ -45,85 +46,99 @@ def get_best_format(url, target_resolution):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         
-        # Get all MP4 formats
-        mp4_formats = []
+        # Count available formats
+        video_formats = []
+        audio_formats = []
+        
         for f in info.get('formats', []):
-            if f.get('ext') == 'mp4' and f.get('height') and f.get('vcodec') != 'none':
-                mp4_formats.append({
+            if f.get('vcodec') != 'none' and f.get('height'):  # Video streams
+                video_formats.append({
                     'format_id': f.get('format_id'),
                     'height': f.get('height'),
-                    'filesize': f.get('filesize', 0),
-                    'fps': f.get('fps', 0),
-                    'format_note': f.get('format_note', ''),
-                    'vcodec': f.get('vcodec', '')
+                    'ext': f.get('ext'),
+                    'filesize': f.get('filesize', 0)
                 })
+            elif f.get('acodec') != 'none' and f.get('vcodec') == 'none':  # Audio only
+                audio_formats.append(f.get('format_id'))
         
-        print(f"📊 Found {len(mp4_formats)} MP4 formats:")
-        for fmt in sorted(mp4_formats, key=lambda x: x['height'], reverse=True)[:10]:
+        print(f"📊 Video formats: {len(video_formats)}")
+        print(f"📊 Audio formats: {len(audio_formats)}")
+        
+        # Show top video formats
+        sorted_videos = sorted(video_formats, key=lambda x: x['height'], reverse=True)[:5]
+        for fmt in sorted_videos:
             size = fmt['filesize'] / (1024*1024) if fmt['filesize'] else '?'
-            print(f"  {fmt['format_id']}: {fmt['height']}p ({size:.1f}MB, {fmt['fps']}fps)")
+            print(f"  {fmt['format_id']}: {fmt['height']}p {fmt['ext']} ({size:.1f}MB)")
         
-        if not mp4_formats:
-            print("❌ No MP4 formats found - trying any video")
-            # Fallback: best video regardless of container
-            return 'best[height<=720]/best'
-        
-        # Find best MP4 <= target resolution
         target_height = int(target_resolution[:-1])
-        best_format = None
+        
+        # Strategy 1: Progressive MP4 (video + audio combined)
+        progressive_mp4 = None
+        for fmt in video_formats:
+            if (fmt['ext'] == 'mp4' and 
+                fmt['height'] <= target_height and 
+                fmt.get('acodec') != 'none'):
+                progressive_mp4 = fmt['format_id']
+                print(f"✅ Progressive MP4 found: {progressive_mp4} ({fmt['height']}p)")
+                return f"{progressive_mp4}", {'type': 'progressive', 'height': fmt['height']}
+        
+        # Strategy 2: DASH merge (best video + best audio)
+        best_video = None
         best_height = 0
         
-        for fmt in mp4_formats:
+        for fmt in video_formats:
             height = fmt['height']
             if height <= target_height and height > best_height:
-                best_format = fmt['format_id']
+                best_video = fmt['format_id']
                 best_height = height
         
-        # If no exact match, take highest available
-        if not best_format:
-            best_format = max(mp4_formats, key=lambda x: x['height'])['format_id']
-            best_height = max(mp4_formats, key=lambda x: x['height'])['height']
+        if best_video:
+            # Merge with best audio
+            format_selector = f"{best_video}+bestaudio[ext=m4a]/best[height<={target_height}]"
+            print(f"✅ DASH merge: {best_video} ({best_height}p) + audio")
+            return format_selector, {'type': 'dash', 'height': best_height, 'video_id': best_video}
         
-        format_selector = f"{best_format}/best[ext=mp4]"
-        print(f"✅ Selected: {best_format} ({best_height}p)")
+        # Strategy 3: Best available
+        if video_formats:
+            best_fmt = max(video_formats, key=lambda x: x['height'])
+            format_selector = f"{best_fmt['format_id']}+bestaudio/best"
+            print(f"⚠️ Fallback: {best_fmt['format_id']} ({best_fmt['height']}p)")
+            return format_selector, {'type': 'fallback', 'height': best_fmt['height']}
         
-        return format_selector, {
-            'selected_format_id': best_format,
-            'selected_height': best_height,
-            'total_mp4_formats': len(mp4_formats)
-        }
+        return 'best', {'type': 'best', 'height': 'unknown'}
 
 # ================================
 # 🛠️ FILE FINDER
 # ================================
 
 def find_video_file(temp_dir):
-    """Find largest video file"""
+    """Find final merged video file"""
     if not os.path.exists(temp_dir):
         return None
     
     all_files = os.listdir(temp_dir)
-    video_files = [f for f in all_files if any(f.lower().endswith(ext) for ext in ['.mp4', '.mkv', '.webm'])]
+    video_exts = ['.mp4', '.mkv', '.webm']
+    video_files = [f for f in all_files if any(f.endswith(ext) for ext in video_exts)]
     
-    print(f"📁 Found video files: {video_files}")
+    print(f"📁 Final files: {video_files}")
     
-    if not video_files:
-        # Show all files for debug
-        file_sizes = {}
-        for f in all_files:
-            path = os.path.join(temp_dir, f)
-            if os.path.isfile(path):
-                size = os.path.getsize(path) / (1024*1024)
-                file_sizes[f] = f"{size:.1f}MB"
-        print(f"❌ No video files! All files: {file_sizes}")
-        return None
+    if video_files:
+        # Pick largest (usually merged file)
+        largest = max(video_files, key=lambda f: os.path.getsize(os.path.join(temp_dir, f)))
+        filepath = os.path.join(temp_dir, largest)
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        print(f"✅ Selected: {largest} ({size_mb:.1f}MB)")
+        return filepath
     
-    # Return largest video file
-    largest_file = max(video_files, key=lambda f: os.path.getsize(os.path.join(temp_dir, f)))
-    filepath = os.path.join(temp_dir, largest_file)
-    size_mb = os.path.getsize(filepath) / (1024*1024)
-    print(f"✅ Largest video: {largest_file} ({size_mb:.1f}MB)")
-    return filepath
+    # Debug: show all files
+    debug = {}
+    for f in all_files:
+        path = os.path.join(temp_dir, f)
+        if os.path.isfile(path):
+            size = os.path.getsize(path) / (1024 * 1024)
+            debug[f] = f"{size:.1f}MB"
+    print(f"❌ No final video! Raw files: {debug}")
+    return None
 
 # ================================
 # 🏥 HEALTH CHECK
@@ -133,8 +148,8 @@ def find_video_file(temp_dir):
 def health():
     return jsonify({
         'status': 'healthy',
-        'version': '2.4',
-        'message': '🎥 Dynamic MP4 Selector API'
+        'version': '2.5',
+        'message': '🎥 DASH + Merge YouTube Downloader'
     })
 
 # ================================
@@ -148,16 +163,12 @@ def get_video_info():
         return jsonify({'success': False, 'error': 'Missing url parameter'}), 400
     
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-        }
-        
+        ydl_opts = {'quiet': True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
-            # Count MP4 formats
-            mp4_count = sum(1 for f in info.get('formats', []) if f.get('ext') == 'mp4')
+            # Count video formats
+            video_count = sum(1 for f in info.get('formats', []) if f.get('vcodec') != 'none')
             
             result = {
                 'success': True,
@@ -167,13 +178,13 @@ def get_video_info():
                 'duration': info.get('duration', 0),
                 'length': info.get('duration', 0),
                 'thumbnail': info.get('thumbnail'),
-                'mp4_formats': mp4_count,
+                'video_formats': video_count,
                 'can_download': True
             }
             
             if result['length'] > MAX_DURATION:
                 result['can_download'] = False
-                result['error'] = f'Video too long'
+                result['error'] = f'Video too long ({result["length"]}s)'
             
             return jsonify(result)
             
@@ -181,7 +192,7 @@ def get_video_info():
         return jsonify({'success': False, 'error': f'Info failed: {str(e)}'}), 500
 
 # ================================
-# ⬇️ DYNAMIC DOWNLOAD
+# ⬇️ UNIVERSAL DOWNLOAD
 # ================================
 
 @app.route('/download', methods=['POST'])
@@ -197,22 +208,27 @@ def download_video():
         if not url:
             return jsonify({'success': False, 'error': 'Missing url'}), 400
         
-        print(f"\n🎬 DYNAMIC DOWNLOAD START")
+        if resolution not in ALLOWED_RESOLUTIONS:
+            resolution = DEFAULT_RESOLUTION
+        
+        print(f"\n🎬 DOWNLOAD START v2.5")
         print(f"🔗 URL: {url}")
         print(f"📐 Target: {resolution}")
         
-        # Clear temp dir
+        # Clean temp dir
         if os.path.exists(TEMP_DIR):
             shutil.rmtree(TEMP_DIR, ignore_errors=True)
         os.makedirs(TEMP_DIR, exist_ok=True)
         
-        # 🔥 DYNAMIC FORMAT SELECTION
+        # Get best format
         format_selector, format_info = get_best_format(url, resolution)
-        print(f"📐 Using format: {format_selector}")
+        print(f"📐 Format: {format_selector}")
+        print(f"📊 Strategy: {format_info}")
         
         ydl_opts = {
             'format': format_selector,
             'outtmpl': '%(title)s.%(ext)s',
+            'merge_output_format': 'mp4',  # Always merge to MP4
             
             # Debug
             'quiet': False,
@@ -222,35 +238,34 @@ def download_video():
             'writethumbnail': False,
             'write_all_thumbnails': False,
             'embed_thumbnail': False,
-            'embed_metadata': False,
             'noplaylist': True,
             
             # Paths
             'paths': {'home': TEMP_DIR},
         }
         
-        print("⬇️ Starting download...")
+        print("⬇️ Downloading...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            print(f"✅ Download complete: {info.get('title')}")
+            print(f"✅ Complete: {info.get('title')}")
         
-        # Find video file
+        # Find final MP4
         video_file = find_video_file(TEMP_DIR)
         if not video_file:
             files = os.listdir(TEMP_DIR) if os.path.exists(TEMP_DIR) else []
             return jsonify({
                 'success': False,
-                'error': f'No video file found. Files: {files}'
+                'error': f'No video file. Files: {files}'
             }), 500
         
         file_size = os.path.getsize(video_file)
         if file_size > MAX_FILE_SIZE:
             os.remove(video_file)
-            return jsonify({'success': False, 'error': f'File too large'}), 413
+            return jsonify({'success': False, 'error': f'File too large: {file_size/(1024*1024):.1f}MB'}), 413
         
         # Safe filename
-        title = info.get('title', 'video')[:80]
-        safe_filename = re.sub(r'[^\w\s-]', '_', title) + '.mp4'
+        title = re.sub(r'[^\w\s-]', '_', info.get('title', 'video'))[:80]
+        safe_filename = f"{title}_{format_info['height']}p.mp4"
         print(f"📤 Sending: {safe_filename} ({file_size/(1024*1024):.1f}MB)")
         
         response = send_file(
@@ -267,13 +282,14 @@ def download_video():
                 if os.path.exists(video_file):
                     os.remove(video_file)
                 shutil.rmtree(TEMP_DIR, ignore_errors=True)
-            except:
-                pass
+                print("🧹 Cleanup done")
+            except Exception as e:
+                print(f"⚠️ Cleanup error: {e}")
         
         return response
         
     except yt_dlp.DownloadError as e:
-        print(f"❌ yt-dlp error: {str(e)}")
+        print(f"❌ Download error: {str(e)}")
         return jsonify({'success': False, 'error': f'Download failed: {str(e)}'}), 400
     except Exception as e:
         print(f"❌ Server error: {str(e)}")
@@ -288,6 +304,7 @@ def download_video():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     host = '0.0.0.0'
-    print(f"🎥 Starting Dynamic MP4 API v2.4")
+    print(f"🎥 Starting Universal Downloader v2.5")
     print(f"🌐 {host}:{port}")
+    print("✅ Handles DASH + progressive MP4")
     app.run(host=host, port=port, debug=False, threaded=True)
