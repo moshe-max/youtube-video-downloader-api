@@ -1,69 +1,76 @@
-import os
-import time
 from flask import Flask, request, jsonify
-import yt_dlp
+from pytube import YouTube
+import re
 
 app = Flask(__name__)
 
-# Validate API key
-def validate_api_key(request):
-    api_key = os.getenv('API_KEY')
-    if not api_key:
-        return False, "API key not configured"
-    auth_header = request.headers.get('Authorization')
-    if not auth_header or auth_header != f"Bearer {api_key}":
-        return False, "Invalid or missing API key"
-    return True, None
+def download_video(url, resolution):
+    try:
+        yt = YouTube(url)
+        stream = yt.streams.filter(progressive=True, file_extension='mp4', resolution=resolution).first()
+        if stream:
+            stream.download()
+            return True, None
+        else:
+            return False, "Video with the specified resolution not found."
+    except Exception as e:
+        return False, str(e)
 
-# YouTube download function with retry logic for 429 errors
-def download_video(url, output_dir='/tmp'):
-    retries = int(os.getenv('DOWNLOAD_RETRIES', 3))
-    delay = int(os.getenv('RETRY_DELAY', 1))
+def get_video_info(url):
+    try:
+        yt = YouTube(url)
+        stream = yt.streams.first()
+        video_info = {
+            "title": yt.title,
+            "author": yt.author,
+            "length": yt.length,
+            "views": yt.views,
+            "description": yt.description,
+            "publish_date": yt.publish_date,
+        }
+        return video_info, None
+    except Exception as e:
+        return None, str(e)
 
-    for attempt in range(retries):
-        try:
-            ydl_opts = {
-                'outtmpl': os.path.join(output_dir, '%(id)s.%(ext)s'),
-                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                'quiet': True,
-                'merge_output_format': 'mp4'
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-            return True, filename
-        except Exception as e:
-            if '429' in str(e):
-                time.sleep(delay * (2 ** attempt))  # Exponential backoff
-            else:
-                return False, str(e)
-    return False, 'Max retries exceeded'
+def is_valid_youtube_url(url):
+    pattern = r"^(https?://)?(www\.)?youtube\.com/watch\?v=[\w-]+(&\S*)?$"
+    return re.match(pattern, url) is not None
 
-# API endpoint for downloading YouTube videos
-@app.route('/download', methods=['POST'])
-def download_youtube():
-    # Validate API key
-    is_valid, error = validate_api_key(request)
-    if not is_valid:
-        return jsonify({'error': error}), 401
-
+@app.route('/download/<resolution>', methods=['POST'])
+def download_by_resolution(resolution):
     data = request.get_json()
     url = data.get('url')
-
+    
     if not url:
-        return jsonify({'error': 'URL is required'}), 400
+        return jsonify({"error": "Missing 'url' parameter in the request body."}), 400
 
-    success, result = download_video(url)
+    if not is_valid_youtube_url(url):
+        return jsonify({"error": "Invalid YouTube URL."}), 400
+    
+    success, error_message = download_video(url, resolution)
+    
     if success:
-        return jsonify({'status': 'success', 'file': result}), 200
+        return jsonify({"message": f"Video with resolution {resolution} downloaded successfully."}), 200
     else:
-        return jsonify({'status': 'error', 'message': result}), 500
+        return jsonify({"error": error_message}), 500
 
-# Health check endpoint for Render
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({'status': 'healthy'}), 200
+@app.route('/video_info', methods=['POST'])
+def video_info():
+    data = request.get_json()
+    url = data.get('url')
+    
+    if not url:
+        return jsonify({"error": "Missing 'url' parameter in the request body."}), 400
+
+    if not is_valid_youtube_url(url):
+        return jsonify({"error": "Invalid YouTube URL."}), 400
+    
+    video_info, error_message = get_video_info(url)
+    
+    if video_info:
+        return jsonify(video_info), 200
+    else:
+        return jsonify({"error": error_message}), 500
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(debug=True)
