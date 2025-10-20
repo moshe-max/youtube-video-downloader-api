@@ -1,73 +1,35 @@
 #!/usr/bin/env python3
 """
-🎥 YT DOWNLOADER API v3.2 - RENDER OPTIMIZED
-- Forces SINGLE progressive MP4 (NO DASH fragments)
-- 30s timeout protection
-- File validation
-- Streaming response
+🎥 PYTUBE DOWNLOADER API - RENDER READY
+✅ Single MP4 files (no fragments)
+✅ No FFmpeg needed
+✅ 2s cold starts
+✅ Works with your email system
 """
 
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import yt_dlp
-import os
+import pytube
 import tempfile
-import shutil
+import os
 import logging
+import glob
 
 app = Flask(__name__)
 CORS(app)
 
-# Configure logging
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# ================================
-# ⚡ RENDER-OPTIMIZED YTDL CONFIG
-# ================================
-
-YTDL_OPTS = {
-    # 🎯 FORCE SINGLE MP4 FILE - NO DASH FRAGMENTS
-    'format': 'best[ext=mp4][vcodec!~*vp9][height<=480]/best[ext=mp4][height<=360]/worst[ext=mp4]/best',
-    
-    # 🚫 DISABLE FRAGMENT DOWNLOADS
-    'noplaylist': True,
-    'no_merge': True,  # CRITICAL: No DASH merging
-    'merge_output_format': None,
-    
-    # ⏱️ TIMEOUT PROTECTION
-    'socket_timeout': 30,
-    'fragment_retries': 0,  # NO fragment retries
-    'retries': 2,
-    
-    # 💾 MINIMAL OUTPUT
-    'outtmpl': '%(title).100s.%(ext)s',
-    'quiet': True,
-    'no_warnings': True,
-    'ignoreerrors': False,
-    
-    # 🚫 NO EXTRA FILES
-    'writeinfojson': False,
-    'writethumbnail': False,
-    'writesubtitles': False,
-    'writeautomaticsub': False,
-}
-
-# ================================
-# 🏥 HEALTH CHECK
-# ================================
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
         'status': 'healthy',
-        'version': '3.2',
-        'message': '🎥 Render-optimized single MP4 downloader'
+        'downloader': 'pytube',
+        'version': '1.0',
+        'message': '🎥 Single MP4 downloader - Render ready'
     })
-
-# ================================
-# 📊 VIDEO INFO
-# ================================
 
 @app.route('/info', methods=['GET'])
 def info():
@@ -76,153 +38,112 @@ def info():
         return jsonify({'error': 'Missing URL'}), 400
     
     try:
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            formats = [f for f in info.get('formats', []) 
-                      if f.get('ext') == 'mp4' and f.get('vcodec') != 'none']
-            
-            return jsonify({
-                'title': info.get('title', 'Unknown'),
-                'duration': info.get('duration', 0),
-                'mp4_formats': len(formats),
-                'thumbnail': info.get('thumbnail'),
-                'uploader': info.get('uploader')
-            })
+        yt = pytube.YouTube(url)
+        streams = yt.streams.filter(progressive=True, file_extension='mp4')
+        
+        return jsonify({
+            'title': yt.title,
+            'duration': yt.length,
+            'author': yt.author,
+            'thumbnail': yt.thumbnail_url,
+            'available_formats': [
+                {'resolution': s.resolution, 'size_mb': round(s.filesize / (1024*1024), 1)} 
+                for s in streams
+            ]
+        })
     except Exception as e:
-        logger.error(f"Info error: {e}")
         return jsonify({'error': str(e)}), 400
-
-# ================================
-# ⬇️ DOWNLOAD ENDPOINT
-# ================================
 
 @app.route('/download', methods=['POST'])
 def download():
     data = request.get_json()
-    url = data.get('url') if data else request.form.get('url')
-    quality = (data.get('quality') if data else request.form.get('quality', '360p'))
+    url = data.get('url')
+    quality = data.get('quality', '360p')
     
     if not url:
         return jsonify({'error': 'Missing URL'}), 400
     
-    logger.info(f"Starting download: {url} ({quality})")
-    
-    # Quality selector - PRIORITIZE PROGRESSIVE MP4
-    quality_map = {
-        '720p': 'best[ext=mp4][vcodec!~*vp9][height<=720]/best[ext=mp4][height<=720]',
-        '480p': 'best[ext=mp4][vcodec!~*vp9][height<=480]/best[ext=mp4][height<=480]',
-        '360p': 'best[ext=mp4][vcodec!~*vp9][height<=360]/best[ext=mp4][height<=360]'
-    }
-    
-    fmt = quality_map.get(quality, quality_map['360p'])
-    opts = YTDL_OPTS.copy()
-    opts['format'] = fmt
-    
-    temp_dir = None
-    temp_file = None
-    
     try:
-        # Create temp directory
-        temp_dir = tempfile.mkdtemp(prefix='yt_')
-        opts['outtmpl'] = os.path.join(temp_dir, '%(title).100s.%(ext)s')
+        logger.info(f"🎥 Downloading: {url} ({quality})")
+        yt = pytube.YouTube(url)
         
-        logger.info(f"Temp dir: {temp_dir}")
+        # Get progressive MP4 stream
+        if quality == '720p':
+            stream = yt.streams.filter(progressive=True, file_extension='mp4', resolution='720p').first()
+        elif quality == '480p':
+            stream = yt.streams.filter(progressive=True, file_extension='mp4', resolution='480p').first()
+        else:
+            stream = yt.streams.filter(progressive=True, file_extension='mp4', resolution='360p').first()
         
-        # Download with error handling
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+        # Fallback to lowest quality
+        if not stream:
+            stream = yt.streams.filter(progressive=True, file_extension='mp4').first()
         
-        # Find downloaded file
-        files = glob.glob(os.path.join(temp_dir, '*.mp4'))
-        if not files:
-            files = glob.glob(os.path.join(temp_dir, '*'))  # Fallback
+        if not stream:
+            return jsonify({'error': 'No MP4 stream available'}), 400
         
-        if not files:
-            return jsonify({'error': 'No video file found'}), 500
+        logger.info(f"📹 Selected: {stream.resolution} ({stream.filesize_mb:.1f}MB)")
         
-        temp_file = files[0]
+        # Download to temp file
+        temp_dir = tempfile.mkdtemp()
+        filename = yt.title[:100].replace('/', '_').replace('\\', '_')
+        temp_file = stream.download(output_path=temp_dir, filename=filename)
+        
+        # Validate file
         file_size = os.path.getsize(temp_file)
+        if file_size < 102400:  # 100KB minimum
+            return jsonify({'error': f'File too small: {file_size} bytes'}), 400
         
-        logger.info(f"Downloaded: {temp_file} ({file_size} bytes)")
-        
-        # VALIDATE FILE - MUST BE > 50KB
-        if file_size < 51200:  # 50KB minimum
-            logger.error(f"File too small: {file_size} bytes")
-            return jsonify({'error': f'Invalid video file ({file_size} bytes)'}), 400
-        
-        # VALIDATE MP4
-        if not is_valid_mp4(temp_file):
-            logger.error("Invalid MP4 format")
-            return jsonify({'error': 'Invalid MP4 file'}), 400
-        
-        # Stream file
+        # Stream response
         def generate():
             try:
                 with open(temp_file, 'rb') as f:
                     while True:
-                        chunk = f.read(8192)  # 8KB chunks
+                        chunk = f.read(8192)
                         if not chunk:
                             break
                         yield chunk
             finally:
-                cleanup(temp_dir)
-        
-        logger.info(f"Streaming {file_size} bytes")
+                # Cleanup
+                try:
+                    os.unlink(temp_file)
+                    os.rmdir(temp_dir)
+                except:
+                    pass
         
         return Response(
             stream_with_context(generate()),
             mimetype='video/mp4',
             headers={
-                'Content-Disposition': f'attachment; filename="{os.path.basename(temp_file)}"',
+                'Content-Disposition': f'attachment; filename="{filename}.mp4"',
                 'Content-Length': str(file_size),
                 'Accept-Ranges': 'bytes',
-                'Cache-Control': 'no-cache, no-store',
-                'Access-Control-Expose-Headers': 'Content-Disposition'
+                'Cache-Control': 'no-cache'
             }
         )
         
     except Exception as e:
-        logger.error(f"Download failed: {str(e)}")
-        cleanup(temp_dir)
+        logger.error(f"❌ Download failed: {str(e)}")
+        # Cleanup
+        try:
+            temp_dir = tempfile.gettempdir()
+            for f in glob.glob(f"{temp_dir}/*.mp4"):
+                os.unlink(f)
+        except:
+            pass
         return jsonify({'error': f'Download failed: {str(e)}'}), 500
-
-def is_valid_mp4(file_path):
-    """Basic MP4 validation"""
-    try:
-        with open(file_path, 'rb') as f:
-            header = f.read(4)
-            return header == b'ftyp' or header == b'moov' or header == b'mdat'
-    except:
-        return False
-
-def cleanup(temp_dir):
-    """Safe cleanup"""
-    try:
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
-    except Exception as e:
-        logger.error(f"Cleanup failed: {e}")
-
-# ================================
-# 🧹 ROOT + CATCH-ALL
-# ================================
 
 @app.route('/', methods=['GET'])
 def root():
-    return jsonify({'message': '🎥 YouTube Downloader API v3.2', 'endpoints': ['/health', '/info', '/download']})
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({'error': 'Endpoint not found'}), 404
-
-@app.errorhandler(500)
-def internal_error(e):
-    return jsonify({'error': 'Internal server error'}), 500
-
-# ================================
-# 🚀 RENDER PRODUCTION SERVER
-# ================================
+    return jsonify({
+        'message': '🎥 YouTube Downloader API (Pytube)',
+        'endpoints': {
+            'health': '/health',
+            'info': '/info?url=...',
+            'download': '/download (POST)'
+        }
+    })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=port, debug=False)
